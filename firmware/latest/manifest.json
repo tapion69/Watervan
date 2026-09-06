@@ -1,0 +1,15 @@
+{
+  "name": "WaterVan",
+  "version": "8.5.0",
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "ota": {
+        "md5": "REPLACE_AFTER_BUILD",
+        "path": "firmware.ota.bin",
+        "release_url": "https://github.com/tapion69/Watervan/releases",
+        "summary": "WaterVan 8.5.0 - OTA via application"
+      }
+    }
+  ]
+}

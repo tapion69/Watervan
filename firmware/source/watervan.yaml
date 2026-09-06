@@ -1,0 +1,1371 @@
+esphome:
+  name: watervan
+  friendly_name: WaterVan V8.5.0
+  project:
+    name: tapion69.watervan
+    version: "8.5.0"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+# ============================================================
+# WATER VAN - 3 METHODES DE CONNEXION
+#
+# 1) Bluetooth BLE -> application WaterVan
+# 2) Wi-Fi local -> navigateur
+# 3) Home Assistant -> API native ESPHome
+#
+# PROVISIONNEMENT WIFI SANS REFLASH :
+# - Au premier demarrage, WaterVan n'a aucun Wi-Fi utilisateur.
+# - Il cree le point d'acces "WaterVan".
+# - L'utilisateur s'y connecte avec son telephone.
+# - La page de configuration captive s'ouvre automatiquement.
+#   Sinon : http://192.168.4.1
+# - Il choisit son Wi-Fi et saisit le mot de passe.
+# - ESPHome sauvegarde les identifiants dans la flash.
+# - Aux demarrages suivants WaterVan rejoint automatiquement ce reseau.
+# - Si le reseau devient indisponible, WaterVan remet le portail
+#   de configuration a disposition apres quelques secondes.
+#
+# IMPORTANT :
+# AUCUN SSID / MOT DE PASSE DU CLIENT N'EST A METTRE DANS LE YAML.
+# ============================================================
+
+wifi:
+  id: watervan_wifi
+  reboot_timeout: 0s
+
+  # MODE AUTONOME :
+  # Sans identifiants Wi-Fi utilisateur valides, WaterVan cree ce reseau.
+  # L'interface est alors disponible sur http://192.168.4.1
+  #
+  # MODE HOME ASSISTANT :
+  # Le bouton "Connecter Home Assistant" utilise wifi.configure avec
+  # le SSID et le mot de passe saisis depuis l'interface WaterVan.
+  # Les identifiants sont sauvegardes en flash.
+  # Une fois connecte au routeur, le point d'acces WaterVan disparait.
+  ap:
+    ssid: "WaterVan"
+    password: "watervan12"
+    ap_timeout: 2s
+    manual_ip:
+      static_ip: 192.168.4.1
+      gateway: 192.168.4.1
+      subnet: 255.255.255.0
+
+web_server:
+  port: 80
+  version: 2
+  js_include: "watervan_ui.js"
+  js_url: ""
+  css_url: ""
+  include_internal: true
+  ota: false
+
+# Home Assistant.
+# Une fois le Wi-Fi configure, l'integration ESPHome peut decouvrir
+# WaterVan sur le reseau local.
+api:
+  reboot_timeout: 0s
+
+# Mises a jour sans ouvrir le boitier.
+# - esphome : secours depuis ESPHome/HA
+# - http_request : mise a jour distante declenchee depuis l'app WaterVan
+http_request:
+  verify_ssl: true
+  timeout: 30s
+
+ota:
+  - platform: esphome
+  - platform: http_request
+    id: watervan_http_ota
+
+preferences:
+  flash_write_interval: 60s
+
+globals:
+  - id: litres_restants
+    type: float
+    restore_value: yes
+    initial_value: '100.0'
+
+  - id: capacite_cuve
+    type: float
+    restore_value: yes
+    initial_value: '100.0'
+
+  - id: seuil_reserve
+    type: float
+    restore_value: yes
+    initial_value: '15.0'
+
+  - id: conso_jour
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  - id: conso_depuis_plein
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  - id: pulses_par_litre
+    type: float
+    restore_value: yes
+    initial_value: '474.0'
+
+  - id: calibration_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: calibration_start_pulses
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: calibration_hz_sum
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: calibration_hz_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: dernier_total_pulses
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: compteur_initialise
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Sert uniquement à décider quand pousser une notification BLE.
+  - id: notification_eau
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: historique_29j
+    type: std::array<float, 29>
+    restore_value: yes
+    initial_value: '{0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0}'
+
+  - id: dernier_jour_local
+    type: int32_t
+    restore_value: yes
+    initial_value: '-1'
+
+  - id: heure_valide
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: epoch_sync
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: millis_sync
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: fuseau_minutes
+    type: int32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Identifiants Wi-Fi reçus temporairement depuis l'application BLE.
+  # Ils ne sont pas conservés ici : wifi.configure les sauvegarde lui-même
+  # uniquement après la demande de connexion.
+  - id: wifi_ssid_ble_buffer
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  - id: wifi_password_ble_buffer
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+
+script:
+  # ----------------------------------------------------------
+  # Connexion au Wi-Fi Home Assistant demandée depuis l'appli BLE
+  # ----------------------------------------------------------
+  - id: connecter_wifi_depuis_ble
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(wifi_ssid_ble_buffer).empty();
+          then:
+            - wifi.configure:
+                ssid: !lambda 'return id(wifi_ssid_ble_buffer);'
+                password: !lambda 'return id(wifi_password_ble_buffer);'
+                save: true
+                timeout: 30000ms
+                on_connect:
+                  - logger.log: "WaterVan connecte au Wi-Fi Home Assistant via BLE"
+                on_error:
+                  - logger.log: "Echec Wi-Fi via BLE : retour automatique au Wi-Fi direct"
+                  - lambda: |-
+                      id(watervan_wifi).save_wifi_sta("", "");
+                      id(watervan_wifi).clear_sta();
+                  - delay: 500ms
+                  - lambda: |-
+                      App.safe_reboot();
+
+  # ----------------------------------------------------------
+  # Passage à un nouveau jour à partir de l'heure du téléphone
+  # ----------------------------------------------------------
+  - id: verifier_changement_jour
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(heure_valide)) {
+            return;
+          }
+
+          uint32_t ecoule_ms = (uint32_t) (millis() - id(millis_sync));
+          uint64_t epoch_actuel = id(epoch_sync) + ((uint64_t) ecoule_ms / 1000ULL);
+
+          int64_t local_seconds =
+            (int64_t) epoch_actuel +
+            ((int64_t) id(fuseau_minutes) * 60LL);
+
+          int32_t jour_actuel =
+            (int32_t) (local_seconds / 86400LL);
+
+          if (id(dernier_jour_local) < 0) {
+            id(dernier_jour_local) = jour_actuel;
+            return;
+          }
+
+          if (jour_actuel < id(dernier_jour_local)) {
+            id(dernier_jour_local) = jour_actuel;
+            return;
+          }
+
+          int32_t ecart = jour_actuel - id(dernier_jour_local);
+
+          if (ecart <= 0) {
+            return;
+          }
+
+          if (ecart > 30) {
+            ecart = 30;
+          }
+
+          for (int32_t n = 0; n < ecart; n++) {
+            for (int i = 0; i < 28; i++) {
+              id(historique_29j)[i] = id(historique_29j)[i + 1];
+            }
+
+            if (n == 0) {
+              id(historique_29j)[28] = id(conso_jour);
+              id(conso_jour) = 0.0f;
+            } else {
+              id(historique_29j)[28] = 0.0f;
+            }
+          }
+
+          id(dernier_jour_local) = jour_actuel;
+
+      # L'historique et les moyennes ne changent qu'au changement de jour.
+      - ble_server.characteristic.notify:
+          id: ble_conso_jour
+      - ble_server.characteristic.notify:
+          id: ble_moyenne_7j
+      - ble_server.characteristic.notify:
+          id: ble_moyenne_30j
+      - ble_server.characteristic.notify:
+          id: ble_historique
+
+
+sensor:
+  - platform: pulse_counter
+    pin:
+      number: GPIO27
+      mode:
+        input: true
+        pullup: true
+
+    id: frequence_debitmetre
+    internal: true
+    unit_of_measurement: "imp/min"
+
+    # Plus réactif que le V4. En l'absence d'impulsions,
+    # aucune notification BLE n'est envoyée.
+    update_interval: 250ms
+    internal_filter: 13us
+
+    total:
+      id: total_pulses_debitmetre
+      internal: true
+
+      on_value:
+        then:
+          - lambda: |-
+              id(notification_eau) = false;
+
+              float total = x;
+
+              if (!id(compteur_initialise)) {
+                id(dernier_total_pulses) = total;
+                id(compteur_initialise) = true;
+                return;
+              }
+
+              float delta = total - id(dernier_total_pulses);
+              id(dernier_total_pulses) = total;
+
+              if (delta <= 0.0f) {
+                return;
+              }
+
+              float hz = id(frequence_debitmetre).state / 60.0f;
+
+              if (id(calibration_active)) {
+                if (!isnan(hz) && hz > 0.0f) {
+                  id(calibration_hz_sum) += hz;
+                  id(calibration_hz_count)++;
+                }
+                return;
+              }
+
+              float ratio = 1.0f;
+
+              if (hz <= 5.34f) {
+                ratio = 0.7975f;
+              } else if (hz < 9.18f) {
+                float p = (hz - 5.34f) / (9.18f - 5.34f);
+                ratio = 0.7975f + p * (0.9220f - 0.7975f);
+              } else if (hz < 13.70f) {
+                float p = (hz - 9.18f) / (13.70f - 9.18f);
+                ratio = 0.9220f + p * (1.0f - 0.9220f);
+              } else {
+                ratio = 1.0f;
+              }
+
+              if (ratio < 0.70f) {
+                ratio = 0.70f;
+              }
+
+              float coefficient = id(pulses_par_litre) * ratio;
+
+              if (coefficient <= 0.0f) {
+                return;
+              }
+
+              float litres = delta / coefficient;
+
+              if (litres <= 0.0f || litres > 5.0f) {
+                return;
+              }
+
+              id(conso_jour) += litres;
+              id(conso_depuis_plein) += litres;
+              id(litres_restants) -= litres;
+
+              if (id(litres_restants) < 0.0f) {
+                id(litres_restants) = 0.0f;
+              }
+
+              // Il y a réellement eu de l'eau :
+              // les nouvelles valeurs seront poussées à l'application.
+              id(notification_eau) = true;
+
+          - if:
+              condition:
+                lambda: 'return id(notification_eau);'
+              then:
+                - ble_server.characteristic.notify:
+                    id: ble_litres_restants
+                - ble_server.characteristic.notify:
+                    id: ble_niveau
+                - ble_server.characteristic.notify:
+                    id: ble_conso_jour
+                - ble_server.characteristic.notify:
+                    id: ble_conso_depuis_plein
+                - ble_server.characteristic.notify:
+                    id: ble_reserve
+
+
+  # ==========================================================
+  # ENTITES POUR HOME ASSISTANT + INTERFACE WEB
+  # ==========================================================
+
+  - platform: template
+    id: ha_litres_restants
+    name: "Eau restante"
+    unit_of_measurement: "L"
+    accuracy_decimals: 1
+    icon: "mdi:water"
+    update_interval: 500ms
+    lambda: |-
+      return id(litres_restants);
+
+  - platform: template
+    id: ha_niveau_cuve
+    name: "Niveau cuve"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:water-percent"
+    update_interval: 500ms
+    lambda: |-
+      if (id(capacite_cuve) <= 0.0f) return 0.0f;
+      float v = (id(litres_restants) / id(capacite_cuve)) * 100.0f;
+      if (v < 0.0f) v = 0.0f;
+      if (v > 100.0f) v = 100.0f;
+      return v;
+
+  - platform: template
+    id: ha_conso_jour
+    name: "Consommation aujourd'hui"
+    unit_of_measurement: "L"
+    accuracy_decimals: 1
+    icon: "mdi:water-minus"
+    update_interval: 500ms
+    lambda: |-
+      return id(conso_jour);
+
+  - platform: template
+    id: ha_conso_depuis_plein
+    name: "Consommation depuis le plein"
+    unit_of_measurement: "L"
+    accuracy_decimals: 1
+    icon: "mdi:water-minus-outline"
+    update_interval: 500ms
+    lambda: |-
+      return id(conso_depuis_plein);
+
+  - platform: template
+    id: ha_moyenne_7j
+    name: "Moyenne 7 jours"
+    unit_of_measurement: "L/j"
+    accuracy_decimals: 1
+    icon: "mdi:chart-line"
+    update_interval: 5s
+    lambda: |-
+      float total = id(conso_jour);
+      for (int i = 23; i < 29; i++) {
+        total += id(historique_29j)[i];
+      }
+      return total / 7.0f;
+
+  - platform: template
+    id: ha_moyenne_30j
+    name: "Moyenne 30 jours"
+    unit_of_measurement: "L/j"
+    accuracy_decimals: 1
+    icon: "mdi:chart-line"
+    update_interval: 5s
+    lambda: |-
+      float total = id(conso_jour);
+      for (int i = 0; i < 29; i++) {
+        total += id(historique_29j)[i];
+      }
+      return total / 30.0f;
+
+
+  # Valeur utile pour contrôle après calibration.
+  # Les compteurs de pulses bruts restent internes.
+  - platform: template
+    id: ha_calibration_pulses
+    name: "Calibration debitmetre"
+    unit_of_measurement: "imp/L"
+    accuracy_decimals: 1
+    icon: "mdi:counter"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      return id(pulses_par_litre);
+
+  # Une valeur par jour : Home Assistant peut conserver et tracer
+  # cette entité sur 30 jours sans afficher du JSON.
+  - platform: template
+    id: ha_conso_journaliere
+    name: "Consommation journaliere"
+    unit_of_measurement: "L"
+    accuracy_decimals: 1
+    icon: "mdi:chart-bar"
+    state_class: measurement
+    update_interval: 5s
+    lambda: |-
+      return id(historique_29j)[28];
+
+
+interval:
+  - interval: 60s
+    then:
+      - script.execute: verifier_changement_jour
+
+
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: wifi_ip
+      internal: true
+    ssid:
+      id: wifi_ssid_actuel
+      internal: true
+
+  - platform: template
+    id: web_historique_30j
+    name: "Historique 30 jours JSON"
+    internal: true
+    icon: "mdi:chart-bar"
+    update_interval: 5s
+    lambda: |-
+      std::string s = "[";
+      for (int i = 0; i < 29; i++) {
+        if (i > 0) s += ",";
+        char b[16];
+        snprintf(b, sizeof(b), "%.1f", id(historique_29j)[i]);
+        s += b;
+      }
+      s += ",";
+      char b[16];
+      snprintf(b, sizeof(b), "%.1f", id(conso_jour));
+      s += b;
+      s += "]";
+      return s;
+
+
+# ============================================================
+# CONFIGURATION WIFI POUR HOME ASSISTANT
+# ============================================================
+text:
+  - platform: template
+    id: wifi_ssid_saisie
+    name: "WiFi Home Assistant"
+    internal: true
+    optimistic: true
+    restore_value: false
+    min_length: 1
+    max_length: 32
+    mode: text
+
+  - platform: template
+    id: wifi_password_saisie
+    name: "Mot de passe WiFi"
+    internal: true
+    optimistic: true
+    restore_value: false
+    min_length: 0
+    max_length: 64
+    mode: password
+
+# ============================================================
+# ETAT RESERVE
+# ============================================================
+binary_sensor:
+  - platform: template
+    id: ha_reserve
+    name: "Reserve eau"
+    device_class: problem
+    lambda: |-
+      return id(litres_restants) <= id(seuil_reserve);
+
+
+# ============================================================
+# REGLAGES ACCESSIBLES DEPUIS HA ET LE WEB
+# ============================================================
+number:
+  - platform: template
+    id: ha_capacite_cuve
+    name: "Capacite cuve"
+    icon: "mdi:cup-water"
+    unit_of_measurement: "L"
+    min_value: 10
+    max_value: 500
+    step: 1
+    mode: box
+    optimistic: false
+    update_interval: 1s
+    lambda: |-
+      return id(capacite_cuve);
+    set_action:
+      - lambda: |-
+          id(capacite_cuve) = x;
+          if (id(litres_restants) > x) {
+            id(litres_restants) = x;
+          }
+          if (id(seuil_reserve) >= x) {
+            id(seuil_reserve) = x * 0.15f;
+          }
+      - ble_server.characteristic.notify:
+          id: ble_capacite
+      - ble_server.characteristic.notify:
+          id: ble_litres_restants
+      - ble_server.characteristic.notify:
+          id: ble_niveau
+      - ble_server.characteristic.notify:
+          id: ble_seuil_reserve
+      - ble_server.characteristic.notify:
+          id: ble_reserve
+
+  - platform: template
+    id: ha_seuil_reserve
+    name: "Seuil reserve"
+    icon: "mdi:water-alert"
+    unit_of_measurement: "L"
+    min_value: 1
+    max_value: 100
+    step: 1
+    mode: box
+    optimistic: false
+    update_interval: 1s
+    lambda: |-
+      return id(seuil_reserve);
+    set_action:
+      - lambda: |-
+          if (x >= 1.0f && x < id(capacite_cuve)) {
+            id(seuil_reserve) = x;
+          }
+      - ble_server.characteristic.notify:
+          id: ble_seuil_reserve
+      - ble_server.characteristic.notify:
+          id: ble_reserve
+
+  # Entrer ici la quantite d'eau ajoutee.
+  # Chaque validation ajoute cette quantite a la cuve.
+  - platform: template
+    id: ha_appoint_eau
+    name: "Ajouter de l'eau"
+    icon: "mdi:water-plus"
+    unit_of_measurement: "L"
+    min_value: 1
+    max_value: 100
+    step: 1
+    mode: box
+    optimistic: true
+    initial_value: 10
+    restore_value: false
+    set_action:
+      - lambda: |-
+          float ajout = x;
+          if (ajout <= 0.0f) return;
+
+          id(litres_restants) += ajout;
+          if (id(litres_restants) > id(capacite_cuve)) {
+            id(litres_restants) = id(capacite_cuve);
+          }
+
+          id(conso_depuis_plein) -= ajout;
+          if (id(conso_depuis_plein) < 0.0f) {
+            id(conso_depuis_plein) = 0.0f;
+          }
+      - ble_server.characteristic.notify:
+          id: ble_litres_restants
+      - ble_server.characteristic.notify:
+          id: ble_niveau
+      - ble_server.characteristic.notify:
+          id: ble_conso_depuis_plein
+      - ble_server.characteristic.notify:
+          id: ble_reserve
+
+
+# ============================================================
+# COMMANDES ACCESSIBLES DEPUIS HA ET LE WEB
+# ============================================================
+button:
+  - platform: template
+    id: ha_cuve_pleine
+    name: "Cuve pleine"
+    icon: "mdi:water-check"
+    on_press:
+      - lambda: |-
+          id(litres_restants) = id(capacite_cuve);
+          id(conso_depuis_plein) = 0.0f;
+      - ble_server.characteristic.notify:
+          id: ble_litres_restants
+      - ble_server.characteristic.notify:
+          id: ble_niveau
+      - ble_server.characteristic.notify:
+          id: ble_conso_depuis_plein
+      - ble_server.characteristic.notify:
+          id: ble_reserve
+
+  - platform: template
+    id: ha_calibration_start
+    name: "Calibration 1L - Demarrer"
+    icon: "mdi:cup-water"
+    on_press:
+      - lambda: |-
+          id(calibration_active) = true;
+          id(calibration_start_pulses) = id(total_pulses_debitmetre).state;
+          id(calibration_hz_sum) = 0.0f;
+          id(calibration_hz_count) = 0;
+
+  - platform: template
+    id: ha_calibration_stop
+    name: "Calibration 1L - Terminer"
+    icon: "mdi:check-decagram"
+    on_press:
+      - lambda: |-
+          if (!id(calibration_active)) return;
+
+          float maintenant = id(total_pulses_debitmetre).state;
+          float pulses_mesurees =
+            maintenant - id(calibration_start_pulses);
+
+          id(calibration_active) = false;
+
+          if (pulses_mesurees < 100.0f ||
+              pulses_mesurees > 1000.0f) {
+            ESP_LOGW(
+              "WaterVan",
+              "Calibration refusee : %.1f pulses",
+              pulses_mesurees
+            );
+            return;
+          }
+
+          float hz_moyen = 13.70f;
+          if (id(calibration_hz_count) > 0) {
+            hz_moyen =
+              id(calibration_hz_sum) /
+              (float) id(calibration_hz_count);
+          }
+
+          float ratio = 1.0f;
+
+          if (hz_moyen <= 5.34f) {
+            ratio = 0.7975f;
+          } else if (hz_moyen < 9.18f) {
+            float p =
+              (hz_moyen - 5.34f) /
+              (9.18f - 5.34f);
+            ratio =
+              0.7975f +
+              p * (0.9220f - 0.7975f);
+          } else if (hz_moyen < 13.70f) {
+            float p =
+              (hz_moyen - 9.18f) /
+              (13.70f - 9.18f);
+            ratio =
+              0.9220f +
+              p * (1.0f - 0.9220f);
+          }
+
+          if (ratio < 0.70f) ratio = 0.70f;
+
+          id(pulses_par_litre) =
+            pulses_mesurees / ratio;
+
+          ESP_LOGI(
+            "WaterVan",
+            "Calibration OK : %.1f pulses/L",
+            id(pulses_par_litre)
+          );
+      - ble_server.characteristic.notify:
+          id: ble_calibration_pulses
+
+  - platform: template
+    id: ha_reset_historique
+    name: "Reset historique"
+    icon: "mdi:delete-clock"
+    on_press:
+      - lambda: |-
+          for (int i = 0; i < 29; i++) {
+            id(historique_29j)[i] = 0.0f;
+          }
+          id(conso_jour) = 0.0f;
+      - ble_server.characteristic.notify:
+          id: ble_conso_jour
+      - ble_server.characteristic.notify:
+          id: ble_moyenne_7j
+      - ble_server.characteristic.notify:
+          id: ble_moyenne_30j
+      - ble_server.characteristic.notify:
+          id: ble_historique
+
+
+
+
+  - platform: template
+    id: ha_connecter_wifi
+    name: "Connecter Home Assistant"
+    internal: true
+    icon: "mdi:home-assistant"
+    on_press:
+      - if:
+          condition:
+            lambda: |-
+              return !id(wifi_ssid_saisie).state.empty();
+          then:
+            - wifi.configure:
+                ssid: !lambda 'return id(wifi_ssid_saisie).state;'
+                password: !lambda 'return id(wifi_password_saisie).state;'
+                save: true
+                timeout: 30000ms
+                on_connect:
+                  - logger.log: "WaterVan connecte au Wi-Fi Home Assistant"
+                on_error:
+                  - logger.log: "Echec Wi-Fi : retour automatique au Wi-Fi direct"
+                  - lambda: |-
+                      id(watervan_wifi).save_wifi_sta("", "");
+                      id(watervan_wifi).clear_sta();
+                  - delay: 500ms
+                  - lambda: |-
+                      App.safe_reboot();
+
+  - platform: template
+    id: ha_retour_wifi_direct
+    name: "Revenir au WiFi direct"
+    icon: "mdi:wifi-refresh"
+    on_press:
+      - lambda: |-
+          // Efface uniquement les identifiants Wi-Fi utilisateur.
+          // Les litres, la calibration et l'historique WaterVan sont conserves.
+          id(watervan_wifi).save_wifi_sta("", "");
+          id(watervan_wifi).clear_sta();
+      - delay: 500ms
+      - lambda: |-
+          App.safe_reboot();
+
+esp32_ble:
+  name: "WaterVan"
+
+
+esp32_ble_server:
+  manufacturer: "WaterVan"
+  max_clients: 1
+
+  on_connect:
+    - logger.log:
+        format: "Telephone connecte a WaterVan"
+        level: INFO
+
+  on_disconnect:
+    - logger.log:
+        format: "Telephone deconnecte de WaterVan"
+        level: INFO
+
+  services:
+    - uuid: "a1000000-1234-5678-1234-56789abcdef0"
+      advertise: true
+
+      characteristics:
+
+        # 01 - Litres restants
+        - id: ble_litres_restants
+          uuid: "a1000001-1234-5678-1234-56789abcdef0"
+          description: "Litres restants"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float v = id(litres_restants);
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 02 - Niveau %
+        - id: ble_niveau
+          uuid: "a1000002-1234-5678-1234-56789abcdef0"
+          description: "Niveau cuve"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float v = 0.0f;
+              if (id(capacite_cuve) > 0.0f) {
+                v = (id(litres_restants) / id(capacite_cuve)) * 100.0f;
+              }
+              if (v < 0.0f) v = 0.0f;
+              if (v > 100.0f) v = 100.0f;
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 03 - Consommation aujourd'hui
+        - id: ble_conso_jour
+          uuid: "a1000003-1234-5678-1234-56789abcdef0"
+          description: "Consommation aujourd'hui"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float v = id(conso_jour);
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 04 - Réserve
+        - id: ble_reserve
+          uuid: "a1000004-1234-5678-1234-56789abcdef0"
+          description: "Reserve"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              uint8_t v = id(litres_restants) <= id(seuil_reserve) ? 1 : 0;
+              return std::vector<uint8_t>{v};
+
+        # 05 - Capacité
+        - id: ble_capacite
+          uuid: "a1000005-1234-5678-1234-56789abcdef0"
+          description: "Capacite cuve"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float v = id(capacite_cuve);
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 06 - Consommation depuis plein
+        - id: ble_conso_depuis_plein
+          uuid: "a1000006-1234-5678-1234-56789abcdef0"
+          description: "Consommation depuis plein"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float v = id(conso_depuis_plein);
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 07 - Seuil réserve
+        - id: ble_seuil_reserve
+          uuid: "a1000007-1234-5678-1234-56789abcdef0"
+          description: "Seuil reserve"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float v = id(seuil_reserve);
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 08 - Moyenne 7 jours
+        - id: ble_moyenne_7j
+          uuid: "a1000008-1234-5678-1234-56789abcdef0"
+          description: "Moyenne 7 jours"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float total = id(conso_jour);
+              for (int i = 23; i < 29; i++) {
+                total += id(historique_29j)[i];
+              }
+              float v = total / 7.0f;
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 09 - Moyenne 30 jours
+        - id: ble_moyenne_30j
+          uuid: "a1000009-1234-5678-1234-56789abcdef0"
+          description: "Moyenne 30 jours"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float total = id(conso_jour);
+              for (int i = 0; i < 29; i++) {
+                total += id(historique_29j)[i];
+              }
+              float v = total / 30.0f;
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 0A - Historique 30 jours
+        - id: ble_historique
+          uuid: "a100000a-1234-5678-1234-56789abcdef0"
+          description: "Historique 30 jours"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              std::vector<uint8_t> data;
+              data.reserve(60);
+
+              for (int i = 0; i < 29; i++) {
+                float litres = id(historique_29j)[i];
+                if (litres < 0.0f) litres = 0.0f;
+                uint16_t dl = (uint16_t) (litres * 10.0f + 0.5f);
+                data.push_back((uint8_t) (dl & 0xFF));
+                data.push_back((uint8_t) ((dl >> 8) & 0xFF));
+              }
+
+              float litres = id(conso_jour);
+              if (litres < 0.0f) litres = 0.0f;
+              uint16_t dl = (uint16_t) (litres * 10.0f + 0.5f);
+              data.push_back((uint8_t) (dl & 0xFF));
+              data.push_back((uint8_t) ((dl >> 8) & 0xFF));
+              return data;
+
+
+        # 18 - Snapshot instantane au demarrage de l'application
+        # 8 x float32 + 1 octet reserve = 33 octets.
+        # Permet a l'application de recuperer toutes les valeurs principales
+        # avec UNE SEULE lecture BLE, sans attendre la lecture sequentielle
+        # de toutes les caracteristiques.
+        - id: ble_snapshot
+          uuid: "a1000018-1234-5678-1234-56789abcdef0"
+          description: "Snapshot WaterVan"
+          read: true
+          value:
+            data: !lambda |-
+              float niveau = 0.0f;
+              if (id(capacite_cuve) > 0.0f) {
+                niveau = (id(litres_restants) / id(capacite_cuve)) * 100.0f;
+              }
+              if (niveau < 0.0f) niveau = 0.0f;
+              if (niveau > 100.0f) niveau = 100.0f;
+
+              float moyenne_7j = id(conso_jour);
+              for (int i = 23; i < 29; i++) {
+                moyenne_7j += id(historique_29j)[i];
+              }
+              moyenne_7j /= 7.0f;
+
+              float moyenne_30j = id(conso_jour);
+              for (int i = 0; i < 29; i++) {
+                moyenne_30j += id(historique_29j)[i];
+              }
+              moyenne_30j /= 30.0f;
+
+              std::vector<uint8_t> data(33);
+              float valeurs[8] = {
+                id(litres_restants),
+                niveau,
+                id(conso_jour),
+                id(conso_depuis_plein),
+                id(capacite_cuve),
+                id(seuil_reserve),
+                moyenne_7j,
+                moyenne_30j
+              };
+
+              memcpy(data.data(), valeurs, sizeof(valeurs));
+              data[32] = id(litres_restants) <= id(seuil_reserve) ? 1 : 0;
+              return data;
+
+        # 19 - SSID Wi-Fi Home Assistant depuis l'application BLE
+        - id: ble_wifi_ssid
+          uuid: "a1000019-1234-5678-1234-56789abcdef0"
+          description: "SSID WiFi Home Assistant"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  if (x.empty() || x.size() > 32) {
+                    ESP_LOGW("WaterVan", "SSID BLE invalide");
+                    return;
+                  }
+                  id(wifi_ssid_ble_buffer).assign(
+                    reinterpret_cast<const char *>(x.data()),
+                    x.size()
+                  );
+
+        # 1A - Revenir au Wi-Fi direct WaterVan depuis l'application
+        - id: ble_cmd_wifi_direct
+          uuid: "a100001a-1234-5678-1234-56789abcdef0"
+          description: "Revenir WiFi direct"
+          write: true
+          on_write:
+            then:
+              - logger.log: "Retour au Wi-Fi direct demande depuis BLE"
+              - lambda: |-
+                  id(watervan_wifi).save_wifi_sta("", "");
+                  id(watervan_wifi).clear_sta();
+              - delay: 500ms
+              - lambda: |-
+                  App.safe_reboot();
+
+        # 1B - Mot de passe Wi-Fi depuis l'application BLE
+        - id: ble_wifi_password
+          uuid: "a100001b-1234-5678-1234-56789abcdef0"
+          description: "Mot de passe WiFi Home Assistant"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  if (x.size() > 64) {
+                    ESP_LOGW("WaterVan", "Mot de passe BLE trop long");
+                    return;
+                  }
+                  id(wifi_password_ble_buffer).assign(
+                    reinterpret_cast<const char *>(x.data()),
+                    x.size()
+                  );
+
+        # 1C - Lance la connexion une fois SSID + mot de passe reçus.
+        - id: ble_wifi_connect
+          uuid: "a100001c-1234-5678-1234-56789abcdef0"
+          description: "Connecter WiFi Home Assistant"
+          write: true
+          on_write:
+            then:
+              - script.execute: connecter_wifi_depuis_ble
+
+        # 10 - Cuve pleine
+        - id: ble_cmd_plein
+          uuid: "a1000010-1234-5678-1234-56789abcdef0"
+          description: "Cuve pleine"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  id(litres_restants) = id(capacite_cuve);
+                  id(conso_depuis_plein) = 0.0f;
+              - ble_server.characteristic.notify:
+                  id: ble_litres_restants
+              - ble_server.characteristic.notify:
+                  id: ble_niveau
+              - ble_server.characteristic.notify:
+                  id: ble_conso_depuis_plein
+              - ble_server.characteristic.notify:
+                  id: ble_reserve
+
+        # 11 - Appoint
+        - id: ble_cmd_appoint
+          uuid: "a1000011-1234-5678-1234-56789abcdef0"
+          description: "Appoint eau"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  if (x.size() < 4) return;
+                  float ajout = 0.0f;
+                  memcpy(&ajout, x.data(), sizeof(float));
+                  if (ajout <= 0.0f) return;
+
+                  id(litres_restants) += ajout;
+                  if (id(litres_restants) > id(capacite_cuve)) {
+                    id(litres_restants) = id(capacite_cuve);
+                  }
+
+                  id(conso_depuis_plein) -= ajout;
+                  if (id(conso_depuis_plein) < 0.0f) {
+                    id(conso_depuis_plein) = 0.0f;
+                  }
+              - ble_server.characteristic.notify:
+                  id: ble_litres_restants
+              - ble_server.characteristic.notify:
+                  id: ble_niveau
+              - ble_server.characteristic.notify:
+                  id: ble_conso_depuis_plein
+              - ble_server.characteristic.notify:
+                  id: ble_reserve
+
+        # 12 - Capacité
+        - id: ble_cmd_capacite
+          uuid: "a1000012-1234-5678-1234-56789abcdef0"
+          description: "Reglage capacite"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  if (x.size() < 4) return;
+                  float nouvelle = 0.0f;
+                  memcpy(&nouvelle, x.data(), sizeof(float));
+
+                  if (nouvelle >= 10.0f && nouvelle <= 500.0f) {
+                    id(capacite_cuve) = nouvelle;
+                    if (id(litres_restants) > nouvelle) {
+                      id(litres_restants) = nouvelle;
+                    }
+                    if (id(seuil_reserve) >= nouvelle) {
+                      id(seuil_reserve) = nouvelle * 0.15f;
+                    }
+                  }
+              - ble_server.characteristic.notify:
+                  id: ble_capacite
+              - ble_server.characteristic.notify:
+                  id: ble_litres_restants
+              - ble_server.characteristic.notify:
+                  id: ble_niveau
+              - ble_server.characteristic.notify:
+                  id: ble_seuil_reserve
+              - ble_server.characteristic.notify:
+                  id: ble_reserve
+
+        # 13 - Seuil réserve
+        - id: ble_cmd_reserve
+          uuid: "a1000013-1234-5678-1234-56789abcdef0"
+          description: "Reglage reserve"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  if (x.size() < 4) return;
+                  float nouvelle = 0.0f;
+                  memcpy(&nouvelle, x.data(), sizeof(float));
+
+                  if (nouvelle >= 1.0f && nouvelle < id(capacite_cuve)) {
+                    id(seuil_reserve) = nouvelle;
+                  }
+              - ble_server.characteristic.notify:
+                  id: ble_seuil_reserve
+              - ble_server.characteristic.notify:
+                  id: ble_reserve
+
+        # 14 - Démarrer calibration
+        - id: ble_cmd_calibration_start
+          uuid: "a1000014-1234-5678-1234-56789abcdef0"
+          description: "Demarrer calibration"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  id(calibration_active) = true;
+                  id(calibration_start_pulses) = id(total_pulses_debitmetre).state;
+                  id(calibration_hz_sum) = 0.0f;
+                  id(calibration_hz_count) = 0;
+
+        # 15 - Terminer calibration
+        - id: ble_cmd_calibration_stop
+          uuid: "a1000015-1234-5678-1234-56789abcdef0"
+          description: "Terminer calibration"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  if (!id(calibration_active)) return;
+
+                  float maintenant = id(total_pulses_debitmetre).state;
+                  float pulses_mesurees = maintenant - id(calibration_start_pulses);
+                  id(calibration_active) = false;
+
+                  if (pulses_mesurees < 100.0f || pulses_mesurees > 1000.0f) {
+                    ESP_LOGW("WaterVan", "Calibration refusee : %.1f pulses", pulses_mesurees);
+                    return;
+                  }
+
+                  float hz_moyen = 13.70f;
+                  if (id(calibration_hz_count) > 0) {
+                    hz_moyen = id(calibration_hz_sum) / (float) id(calibration_hz_count);
+                  }
+
+                  float ratio = 1.0f;
+
+                  if (hz_moyen <= 5.34f) {
+                    ratio = 0.7975f;
+                  } else if (hz_moyen < 9.18f) {
+                    float p = (hz_moyen - 5.34f) / (9.18f - 5.34f);
+                    ratio = 0.7975f + p * (0.9220f - 0.7975f);
+                  } else if (hz_moyen < 13.70f) {
+                    float p = (hz_moyen - 9.18f) / (13.70f - 9.18f);
+                    ratio = 0.9220f + p * (1.0f - 0.9220f);
+                  }
+
+                  if (ratio < 0.70f) ratio = 0.70f;
+
+                  id(pulses_par_litre) = pulses_mesurees / ratio;
+
+                  ESP_LOGI(
+                    "WaterVan",
+                    "Calibration OK : base %.1f pulses/L",
+                    id(pulses_par_litre)
+                  );
+              - ble_server.characteristic.notify:
+                  id: ble_calibration_pulses
+
+        # 1D - Calibration actuelle (imp/L)
+        - id: ble_calibration_pulses
+          uuid: "a100001d-1234-5678-1234-56789abcdef0"
+          description: "Calibration debitmetre"
+          read: true
+          notify: true
+          value:
+            data: !lambda |-
+              float v = id(pulses_par_litre);
+              std::vector<uint8_t> data(sizeof(float));
+              memcpy(data.data(), &v, sizeof(float));
+              return data;
+
+        # 1E - Version firmware WaterVan
+        - id: ble_firmware_version
+          uuid: "a100001e-1234-5678-1234-56789abcdef0"
+          description: "Version firmware WaterVan"
+          read: true
+          value:
+            data: !lambda |-
+              const char *v = "8.5.0";
+              return std::vector<uint8_t>(v, v + strlen(v));
+
+        # 1F - Mise a jour firmware depuis l'application
+        # WaterVan doit etre connecte a un Wi-Fi ayant acces a Internet.
+        - id: ble_cmd_firmware_update
+          uuid: "a100001f-1234-5678-1234-56789abcdef0"
+          description: "Mettre a jour WaterVan"
+          write: true
+          on_write:
+            then:
+              - logger.log:
+                  level: INFO
+                  format: "Mise a jour WaterVan demandee depuis l'application"
+              - ota.http_request.flash:
+                  id: watervan_http_ota
+                  url: "https://tapion69.github.io/Watervan/firmware/latest/firmware.ota.bin"
+                  md5_url: "https://tapion69.github.io/Watervan/firmware/latest/firmware.md5"
+
+        # 16 - Reset historique
+        - id: ble_cmd_reset_historique
+          uuid: "a1000016-1234-5678-1234-56789abcdef0"
+          description: "Reset historique"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  for (int i = 0; i < 29; i++) {
+                    id(historique_29j)[i] = 0.0f;
+                  }
+                  id(conso_jour) = 0.0f;
+              - ble_server.characteristic.notify:
+                  id: ble_conso_jour
+              - ble_server.characteristic.notify:
+                  id: ble_moyenne_7j
+              - ble_server.characteristic.notify:
+                  id: ble_moyenne_30j
+              - ble_server.characteristic.notify:
+                  id: ble_historique
+
+        # 17 - Date/heure téléphone
+        - id: ble_time_sync
+          uuid: "a1000017-1234-5678-1234-56789abcdef0"
+          description: "Synchronisation heure"
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  if (x.size() < 12) return;
+
+                  uint64_t epoch = 0;
+                  int32_t tz = 0;
+
+                  memcpy(&epoch, x.data(), 8);
+                  memcpy(&tz, x.data() + 8, 4);
+
+                  if (epoch < 1700000000ULL || tz < -840 || tz > 840) {
+                    return;
+                  }
+
+                  id(epoch_sync) = epoch;
+                  id(millis_sync) = millis();
+                  id(fuseau_minutes) = tz;
+                  id(heure_valide) = true;
+
+              - script.execute: verifier_changement_jour
